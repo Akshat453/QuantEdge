@@ -1,0 +1,10 @@
+# === Real-Time Stock Market Analytics System ===
+# Install all at once:  pip install -r requirements.txt
+
+yfinance>=0.2.18          # Yahoo Finance API — fetches live stock data
+kafka-python-ng>=2.2.2    # Kafka client — maintained fork, works with Python 3.12+
+pyspark>=3.5.0            # Apache Spark Python API — for local testing/Parquet reads
+streamlit>=1.32.0         # Dashboard framework — builds interactive web UIs
+pandas>=2.0.0             # Data manipulation — tabular data handling
+numpy>=1.24.0             # Numerical computing — math operations on arrays
+plotly>=5.18.0            # Interactive charts — used inside Streamlit dashboard

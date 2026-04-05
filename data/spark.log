@@ -1,0 +1,32 @@
+WARNING: Using incubator modules: jdk.incubator.vector
+:: loading settings :: url = jar:file:/opt/spark/jars/ivy-2.5.3.jar!/org/apache/ivy/core/settings/ivysettings.xml
+Ivy Default Cache set to: /nonexistent/.ivy2.5.2/cache
+The jars for the packages stored in: /nonexistent/.ivy2.5.2/jars
+org.apache.spark#spark-sql-kafka-0-10_2.13 added as a dependency
+:: resolving dependencies :: org.apache.spark#spark-submit-parent-7adce313-e3c8-4922-b015-120b7f39fce7;1.0
+	confs: [default]
+You probably access the destination server through a proxy server that is not well configured.
+You probably access the destination server through a proxy server that is not well configured.
+You probably access the destination server through a proxy server that is not well configured.
+You probably access the destination server through a proxy server that is not well configured.
+Exception in thread "main" java.io.FileNotFoundException: /nonexistent/.ivy2.5.2/cache/resolved-org.apache.spark-spark-submit-parent-7adce313-e3c8-4922-b015-120b7f39fce7-1.0.xml (No such file or directory)
+	at java.base/java.io.FileOutputStream.open0(Native Method)
+	at java.base/java.io.FileOutputStream.open(FileOutputStream.java:289)
+	at java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:230)
+	at java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:179)
+	at org.apache.ivy.plugins.parser.xml.XmlModuleDescriptorWriter.write(XmlModuleDescriptorWriter.java:71)
+	at org.apache.ivy.plugins.parser.xml.XmlModuleDescriptorWriter.write(XmlModuleDescriptorWriter.java:63)
+	at org.apache.ivy.core.module.descriptor.DefaultModuleDescriptor.toIvyFile(DefaultModuleDescriptor.java:553)
+	at org.apache.ivy.core.cache.DefaultResolutionCacheManager.saveResolvedModuleDescriptor(DefaultResolutionCacheManager.java:184)
+	at org.apache.ivy.core.resolve.ResolveEngine.resolve(ResolveEngine.java:259)
+	at org.apache.ivy.Ivy.resolve(Ivy.java:522)
+	at org.apache.spark.util.MavenUtils$.resolveMavenCoordinates(MavenUtils.scala:511)
+	at org.apache.spark.util.DependencyUtils$.resolveMavenDependencies(DependencyUtils.scala:123)
+	at org.apache.spark.deploy.SparkSubmit.prepareSubmitEnvironment(SparkSubmit.scala:341)
+	at org.apache.spark.deploy.SparkSubmit.org$apache$spark$deploy$SparkSubmit$$runMain(SparkSubmit.scala:961)
+	at org.apache.spark.deploy.SparkSubmit.doRunMain$1(SparkSubmit.scala:204)
+	at org.apache.spark.deploy.SparkSubmit.submit(SparkSubmit.scala:227)
+	at org.apache.spark.deploy.SparkSubmit.doSubmit(SparkSubmit.scala:96)
+	at org.apache.spark.deploy.SparkSubmit$$anon$2.doSubmit(SparkSubmit.scala:1132)
+	at org.apache.spark.deploy.SparkSubmit$.main(SparkSubmit.scala:1141)
+	at org.apache.spark.deploy.SparkSubmit.main(SparkSubmit.scala)
