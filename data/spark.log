@@ -3,13 +3,9 @@ WARNING: Using incubator modules: jdk.incubator.vector
 Ivy Default Cache set to: /nonexistent/.ivy2.5.2/cache
 The jars for the packages stored in: /nonexistent/.ivy2.5.2/jars
 org.apache.spark#spark-sql-kafka-0-10_2.13 added as a dependency
-:: resolving dependencies :: org.apache.spark#spark-submit-parent-7adce313-e3c8-4922-b015-120b7f39fce7;1.0
+:: resolving dependencies :: org.apache.spark#spark-submit-parent-bce8da31-19ba-43d9-9eec-01da347f6282;1.0
 	confs: [default]
-You probably access the destination server through a proxy server that is not well configured.
-You probably access the destination server through a proxy server that is not well configured.
-You probably access the destination server through a proxy server that is not well configured.
-You probably access the destination server through a proxy server that is not well configured.
-Exception in thread "main" java.io.FileNotFoundException: /nonexistent/.ivy2.5.2/cache/resolved-org.apache.spark-spark-submit-parent-7adce313-e3c8-4922-b015-120b7f39fce7-1.0.xml (No such file or directory)
+Exception in thread "main" java.io.FileNotFoundException: /nonexistent/.ivy2.5.2/cache/resolved-org.apache.spark-spark-submit-parent-bce8da31-19ba-43d9-9eec-01da347f6282-1.0.xml (No such file or directory)
 	at java.base/java.io.FileOutputStream.open0(Native Method)
 	at java.base/java.io.FileOutputStream.open(FileOutputStream.java:289)
 	at java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:230)

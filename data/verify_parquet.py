@@ -1,154 +1,232 @@
 """
 =================================================================
-Parquet Verification Script — Check Saved Data
+Parquet Verification Utility — Real-Time Stock Analytics
 =================================================================
-What this does:
-  1. Reads the Parquet files saved by Spark Streaming
-  2. Shows total row count
-  3. Shows sample rows for each stock symbol
-  4. Shows min/max close price per symbol
-  5. Shows the partition structure
+Checks both data/processed/ and data/raw_ticks/ for:
+  - Record counts and schema
+  - Presence of all analytics columns (rsi_14, vwap, crash_score, etc.)
+  - File sizes on disk
+  - Sample rows per stock symbol
+  - Partition structure (symbol= and date= directories)
 
-Run INSIDE the Spark Docker container:
-  spark-submit data/verify_parquet.py
-
-OR on your Mac terminal (with venv activated):
+Run on Mac (outside Docker):
   python data/verify_parquet.py
+
+Run inside Spark container (uses PySpark):
+  cd /opt/spark/work && python data/verify_parquet.py
 =================================================================
 """
 
 import os
 import sys
 
-# Detect if running inside Docker or on Mac
-if os.path.exists("/opt/spark/work/data/processed"):
-    PARQUET_PATH = "/opt/spark/work/data/processed"
+# Detect environment and set paths
+INSIDE_DOCKER = os.path.exists("/opt/spark/work")
+if INSIDE_DOCKER:
+    BASE = "/opt/spark/work/data"
 else:
-    PARQUET_PATH = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "data", "processed"
-    )
+    # Running on Mac — resolve relative to this file's parent directory
+    BASE = os.path.dirname(os.path.abspath(__file__))
 
-# Try using PySpark (runs inside container or if pyspark is installed on Mac)
-try:
-    from pyspark.sql import SparkSession
-    from pyspark.sql.functions import col, min as spark_min, max as spark_max, count
+PROCESSED_PATH = os.path.join(BASE, "processed")
+RAW_TICKS_PATH = os.path.join(BASE, "raw_ticks")
+STATE_PATH = os.path.join(BASE, "state")
+LOGS_PATH = os.path.join(BASE, "logs")
 
-    spark = SparkSession.builder \
-        .appName("ParquetVerification") \
-        .master("local[*]") \
-        .getOrCreate()
+# Expected analytics columns from the upgraded Spark job
+EXPECTED_ANALYTICS_COLS = [
+    "symbol", "sector", "open", "high", "low", "close", "volume",
+    "event_time", "data_type", "kafka_produce_time",
+    "moving_avg_5", "moving_avg_20", "price_change_pct", "volatility",
+    "vwap", "rsi_14", "volume_trend", "crash_score",
+    "spark_process_time", "latency_ms",
+]
 
-    spark.sparkContext.setLogLevel("WARN")
 
-    print("=" * 60)
-    print(" PARQUET DATA VERIFICATION")
-    print("=" * 60)
-    print(f"\n📁 Reading from: {PARQUET_PATH}\n")
+def get_dir_size_mb(path: str) -> float:
+    """Recursively sum all .parquet file sizes in a directory."""
+    total: int = 0
+    if os.path.exists(path):
+        for root, _, files in os.walk(path):
+            for f in files:
+                if f.endswith(".parquet"):
+                    try:
+                        total = total + int(os.path.getsize(os.path.join(root, f)))
+                    except OSError:
+                        pass
+    return float(total) / (1024.0 * 1024.0)
 
-    # -------------------------------------------------------
-    # Check if Parquet files exist
-    # -------------------------------------------------------
-    if not os.path.exists(PARQUET_PATH):
-        print("[✗] ERROR: No Parquet files found!")
-        print("    Make sure spark_stream.py has been running")
-        print("    and has processed at least one batch.")
-        sys.exit(1)
 
-    # -------------------------------------------------------
-    # Read the Parquet files
-    # -------------------------------------------------------
-    df = spark.read.parquet(PARQUET_PATH)
+def list_partitions(path: str) -> list:
+    """List first-level partition directories (e.g. symbol=AAPL or date=2026-04-07)."""
+    if not os.path.exists(path):
+        return []
+    return sorted([
+        d for d in os.listdir(path)
+        if os.path.isdir(os.path.join(path, d))
+    ])
 
-    # -------------------------------------------------------
-    # 1. Total row count
-    # -------------------------------------------------------
-    total_rows = df.count()
-    print(f"📊 Total records: {total_rows}")
 
-    if total_rows == 0:
-        print("[!] No data rows found. Let the streaming job run longer.")
-        sys.exit(0)
+def verify_with_pandas(path: str, label: str, expected_cols: list = None):
+    """
+    Verify a Parquet directory using pandas (no Spark needed).
+    Prints schema, record count, unique symbols, file size, and sample.
+    """
+    print(f"\n{'─' * 60}")
+    print(f"  {label}")
+    print(f"  Path: {path}")
+    print(f"{'─' * 60}")
 
-    # -------------------------------------------------------
-    # 2. Show schema
-    # -------------------------------------------------------
-    print("\n📋 Schema:")
-    df.printSchema()
+    if not os.path.exists(path):
+        print("  [!] Path does not exist — Spark has not written data here yet.")
+        return
 
-    # -------------------------------------------------------
-    # 3. Sample rows for each stock symbol
-    # -------------------------------------------------------
-    symbols = [row["symbol"] for row in df.select("symbol").distinct().collect()]
-    print(f"📈 Symbols found: {symbols}\n")
+    size_mb = get_dir_size_mb(path)
+    if size_mb == 0:
+        print("  [!] No .parquet files found. Spark streaming may still be starting up.")
+        return
 
-    for symbol in sorted(symbols):
-        print(f"--- {symbol} (sample rows) ---")
-        df.filter(col("symbol") == symbol) \
-          .select("symbol", "open", "close", "high", "low",
-                  "volume", "price_change_pct", "volatility",
-                  "moving_avg_5", "timestamp") \
-          .orderBy(col("timestamp").desc()) \
-          .show(5, truncate=False)
+    print(f"  Disk size:  {size_mb} MB")
 
-    # -------------------------------------------------------
-    # 4. Min/Max close price per symbol
-    # -------------------------------------------------------
-    print("\n📉 Min/Max Close Price per Symbol:")
-    df.groupBy("symbol") \
-      .agg(
-          spark_min("close").alias("min_close"),
-          spark_max("close").alias("max_close"),
-          count("*").alias("total_records")
-      ) \
-      .orderBy("symbol") \
-      .show(truncate=False)
+    try:
+        import pandas as pd
+        df = pd.read_parquet(path)
+    except Exception as e:
+        print(f"  [x] Could not read Parquet: {e}")
+        return
 
-    # -------------------------------------------------------
-    # 5. Show partition structure
-    # -------------------------------------------------------
-    print("📂 Partition structure (folders on disk):")
-    for entry in sorted(os.listdir(PARQUET_PATH)):
-        if entry.startswith("symbol="):
-            symbol_dir = os.path.join(PARQUET_PATH, entry)
-            if os.path.isdir(symbol_dir):
-                dates = [d for d in os.listdir(symbol_dir) if d.startswith("date=")]
-                print(f"  {entry}/")
-                for date_dir in sorted(dates):
-                    parquet_count = len([
-                        f for f in os.listdir(os.path.join(symbol_dir, date_dir))
-                        if f.endswith(".parquet")
-                    ])
-                    print(f"    {date_dir}/ ({parquet_count} parquet files)")
+    print(f"  Total rows: {len(df):,}")
+    print(f"  Columns:    {len(df.columns)}")
+    print(f"\n  Schema:")
+    for col_name, dtype in df.dtypes.items():
+        print(f"    {col_name:<30} {dtype}")
 
-    print("\n" + "=" * 60)
-    print(" ✅ Verification complete!")
-    print("=" * 60)
+    if "symbol" in df.columns:
+        syms = sorted(df["symbol"].unique())
+        print(f"\n  Unique symbols ({len(syms)}): {syms}")
 
-    spark.stop()
+    if "data_type" in df.columns:
+        breakdown = df["data_type"].value_counts().to_dict()
+        print(f"  Data type breakdown: {breakdown}")
 
-except ImportError:
-    # Fallback: use pandas if pyspark is not available
-    import pandas as pd
+    if expected_cols:
+        missing = [c for c in expected_cols if c not in df.columns]
+        present = [c for c in expected_cols if c in df.columns]
+        print(f"\n  Analytics columns present ({len(present)}/{len(expected_cols)}):")
+        for c in expected_cols:
+            status = "[ok]" if c in df.columns else "[--]"
+            print(f"    {status} {c}")
+        if missing:
+            print(f"\n  [!] Missing (may appear after more batches): {missing}")
 
-    print("=" * 60)
-    print(" PARQUET VERIFICATION (using Pandas)")
-    print("=" * 60)
-    print(f"\n📁 Reading from: {PARQUET_PATH}\n")
+    print(f"\n  Partition structure (top-level dirs):")
+    parts = list_partitions(path)
+    for p in parts[:10]:
+        print(f"    {p}/")
+    if len(parts) > 10:
+        print(f"    ... and {len(parts) - 10} more")
 
-    if not os.path.exists(PARQUET_PATH):
-        print("[✗] ERROR: No Parquet files found!")
-        sys.exit(1)
+    if "symbol" in df.columns:
+        print(f"\n  Sample rows (last 3 per symbol):")
+        sample_cols = [c for c in ["symbol", "close", "price_change_pct", "rsi_14",
+                                   "vwap", "crash_score", "data_type", "event_time"]
+                       if c in df.columns]
+        sort_col = "event_time" if "event_time" in df.columns else df.columns[0]
+        sample = df.sort_values(sort_col)
+        sample = sample.groupby("symbol", observed=True).tail(3)
+        import pandas as pd
+        with pd.option_context("display.max_columns", None, "display.width", 140,
+                               "display.float_format", "{:.2f}".format):
+            print(sample[sample_cols].to_string(index=False))
 
-    df = pd.read_parquet(PARQUET_PATH)
-    print(f"📊 Total records: {len(df)}")
-    print(f"\n📋 Columns: {list(df.columns)}")
-    print(f"\n📈 Symbols: {df['symbol'].unique().tolist()}")
+    if "crash_score" in df.columns:
+        crash_count = int(df["crash_score"].sum())
+        print(f"\n  Crash signals detected: {crash_count}")
 
-    print("\n📉 Min/Max Close per Symbol:")
-    print(df.groupby("symbol")["close"].agg(["min", "max", "count"]))
+    if "latency_ms" in df.columns:
+        avg_lat = df["latency_ms"].mean()
+        print(f"  Avg end-to-end latency: {avg_lat:.0f} ms")
 
-    print("\n--- Sample rows ---")
-    print(df.head(10).to_string())
 
-    print("\n✅ Verification complete!")
+def verify_with_spark(path: str, label: str):
+    """
+    Verify using PySpark — available inside the Docker container.
+    Falls back to pandas if PySpark session cannot be created.
+    """
+    try:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder \
+            .appName("VerifyParquet") \
+            .master("local[2]") \
+            .getOrCreate()
+        spark.sparkContext.setLogLevel("ERROR")
+
+        print(f"\n{'─' * 60}")
+        print(f"  {label} (PySpark mode)")
+        print(f"  Path: {path}")
+        print(f"{'─' * 60}")
+
+        df = spark.read.parquet(path)
+        count = df.count()
+        print(f"  Total rows:  {count:,}")
+        print(f"  Schema:")
+        df.printSchema()
+        if "symbol" in [f.name for f in df.schema.fields]:
+            print("  Per-symbol counts:")
+            df.groupBy("symbol").count().orderBy("symbol").show(50, truncate=False)
+        df.show(5, truncate=False)
+        spark.stop()
+    except Exception:
+        verify_with_pandas(path, label, EXPECTED_ANALYTICS_COLS)
+
+
+def check_logs():
+    """Print a summary of the log files."""
+    print(f"\n{'─' * 60}")
+    print("  Log Files")
+    print(f"{'─' * 60}")
+
+    for fname in ["lb_metrics.jsonl", "spark_metrics.jsonl", "producer.log"]:
+        fpath = os.path.join(LOGS_PATH, fname)
+        if os.path.exists(fpath):
+            size = os.path.getsize(fpath)
+            try:
+                with open(fpath) as f:
+                    lines = f.readlines()
+                print(f"  {fname}: {len(lines)} entries ({size} bytes)")
+            except Exception:
+                print(f"  {fname}: {size} bytes")
+        else:
+            print(f"  {fname}: not found yet")
+
+    # Check per-symbol state files
+    if os.path.exists(STATE_PATH):
+        state_files = [f for f in os.listdir(STATE_PATH) if f.endswith("_history.json")]
+        print(f"\n  Symbol state files: {len(state_files)}")
+        if state_files:
+            syms = [f.replace("_history.json", "") for f in sorted(state_files)]
+            print(f"  Symbols with history: {syms}")
+    else:
+        print("\n  State directory not found (Spark not yet running).")
+
+
+# =================================================================
+# MAIN
+# =================================================================
+print("=" * 60)
+print("  Parquet Verification — Real-Time Stock Analytics (Upgraded)")
+print("=" * 60)
+print(f"  Environment: {'Docker (PySpark)' if INSIDE_DOCKER else 'Mac (pandas)'}")
+
+if INSIDE_DOCKER:
+    verify_with_spark(PROCESSED_PATH, "PROCESSED DATA (enriched analytics)")
+    verify_with_pandas(RAW_TICKS_PATH, "RAW TICKS (Volume V evidence)")
+else:
+    verify_with_pandas(PROCESSED_PATH, "PROCESSED DATA (enriched analytics)", EXPECTED_ANALYTICS_COLS)
+    verify_with_pandas(RAW_TICKS_PATH, "RAW TICKS (Volume V evidence)", None)
+
+check_logs()
+
+print(f"\n{'=' * 60}")
+print("  Verification complete")
+print(f"{'=' * 60}")

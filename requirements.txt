@@ -3,8 +3,13 @@
 
 yfinance>=0.2.18          # Yahoo Finance API — fetches live stock data
 kafka-python-ng>=2.2.2    # Kafka client — maintained fork, works with Python 3.12+
-pyspark>=3.5.0            # Apache Spark Python API — for local testing/Parquet reads
+pyspark==4.0.1            # Apache Spark Python API — must match Docker Spark 4.0.1
 streamlit>=1.32.0         # Dashboard framework — builds interactive web UIs
 pandas>=2.0.0             # Data manipulation — tabular data handling
 numpy>=1.24.0             # Numerical computing — math operations on arrays
 plotly>=5.18.0            # Interactive charts — used inside Streamlit dashboard
+psutil>=5.9.0             # System metrics — CPU%, memory%, for System Performance tab
+pyarrow>=14.0.0           # Parquet I/O — required by pandas read_parquet
+multiprocessing-logging>=0.3.4  # Thread-safe logging with multiprocessing producer
+requests>=2.31.0          # HTTP requests — for any REST API calls
+# finnhub-python>=2.4.19  # Uncomment if switching to Finnhub WebSocket real-time feed

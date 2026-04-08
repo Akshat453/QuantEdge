@@ -1,83 +1,97 @@
 """
 =================================================================
-Spark Structured Streaming — Real-Time Stock Analytics
+Spark Structured Streaming — Real-Time Stock Analytics (Upgraded)
 =================================================================
-What this does:
-  1. Connects to Kafka topic "stock-data" as a consumer
-  2. Reads JSON messages in real-time (micro-batches)
-  3. Parses each message into a structured DataFrame
-  4. Computes analytics:
-     - 5-period Moving Average of close price
-     - Price Change % = ((close - open) / open) * 100
-     - Volatility = (high - low) / open * 100
-     - Volume trend (running sum per symbol)
-  5. Prints results to console (for testing)
-  6. Writes processed data to Parquet files in data/processed/
+Key upgrades:
+  1. Extended schema: sector, kafka_produce_time, data_type
+  2. Event-time processing with watermarking (not processing time)
+  3. State persistence: per-symbol history JSON for correct rolling indicators
+  4. Full analytics: MA5, MA20, RSI14, VWAP, volume_trend, crash_score, latency
+  5. Dual output: raw_ticks (Volume V) + processed (enriched analytics)
+  6. Per-batch metrics logged to data/logs/spark_metrics.jsonl
 
-Run INSIDE the Spark Docker container:
-  spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1 \
+Run INSIDE the Spark Docker container via start_all.sh:
+  spark-submit \
+    --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1 \
+    --conf spark.sql.shuffle.partitions=4 \
+    --conf spark.streaming.backpressure.enabled=true \
+    --conf spark.sql.streaming.forceDeleteTempCheckpointLocation=true \
     spark/spark_stream.py
 =================================================================
 """
 
+import json
+import os
+import time
+from datetime import datetime, date
+
+import pandas as pd
+import numpy as np
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, avg, sum as spark_sum,
-    round as spark_round, current_timestamp, lit,
-    to_date
+    from_json, col, current_timestamp, to_date
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType,
-    LongType, TimestampType
+    LongType, TimestampType, BooleanType
 )
-from pyspark.sql.window import Window
+
+# =================================================================
+# PATHS — all relative to /opt/spark/work (Docker mount point)
+# =================================================================
+BASE = "/opt/spark/work"
+PROCESSED_PATH = f"{BASE}/data/processed"
+RAW_TICKS_PATH = f"{BASE}/data/raw_ticks"
+CHECKPOINT_PATH = f"{BASE}/data/checkpoint"
+STATE_DIR = f"{BASE}/data/state"
+LOG_DIR = f"{BASE}/data/logs"
+SPARK_LOG = f"{BASE}/data/spark_metrics.jsonl"
+
+# Create required directories at startup
+for d in [PROCESSED_PATH, RAW_TICKS_PATH, STATE_DIR, LOG_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# History length to keep per symbol for rolling indicator accuracy
+HISTORY_LEN = 50
 
 # =================================================================
 # 1. CREATE SPARK SESSION
 # =================================================================
-# "master('local[*]')" means use all available CPU cores on this machine
-# "spark.sql.streaming.forceDeleteTempCheckpointLocation" cleans up
-#   leftover checkpoints automatically on restart
-
 spark = SparkSession.builder \
     .appName("StockMarketStreaming") \
     .master("local[*]") \
     .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+    .config("spark.sql.shuffle.partitions", "4") \
     .getOrCreate()
 
-# Reduce Spark's verbose logging to only show warnings and errors
 spark.sparkContext.setLogLevel("WARN")
 
 print("=" * 60)
-print(" Spark Session created successfully!")
+print(" Spark Session created — Stock Market Streaming (Upgraded)")
 print("=" * 60)
 
 # =================================================================
-# 2. DEFINE THE SCHEMA FOR INCOMING JSON MESSAGES
+# 2. EXTENDED SCHEMA — matches producer.py message format
 # =================================================================
-# This must match the JSON structure sent by producer.py:
-# {"symbol": "AAPL", "open": 198.5, "high": 199.0, ...}
-
+# Now includes: sector, kafka_produce_time (for latency), data_type
 stock_schema = StructType([
-    StructField("symbol", StringType(), True),
-    StructField("open", DoubleType(), True),
-    StructField("high", DoubleType(), True),
-    StructField("low", DoubleType(), True),
-    StructField("close", DoubleType(), True),
-    StructField("volume", LongType(), True),
-    StructField("timestamp", StringType(), True)
+    StructField("symbol",             StringType(),    True),
+    StructField("sector",             StringType(),    True),
+    StructField("open",               DoubleType(),    True),
+    StructField("high",               DoubleType(),    True),
+    StructField("low",                DoubleType(),    True),
+    StructField("close",              DoubleType(),    True),
+    StructField("volume",             LongType(),      True),
+    StructField("timestamp",          StringType(),    True),
+    StructField("kafka_produce_time", LongType(),      True),
+    StructField("data_type",          StringType(),    True),
 ])
 
 # =================================================================
 # 3. READ STREAMING DATA FROM KAFKA
 # =================================================================
-# "kafka.bootstrap.servers" — the address of the Kafka broker.
-#   Inside Docker on Mac, "host.docker.internal:9092" reaches the
-#   host machine's port 9092 (where Kafka is exposed).
-# "subscribe" — the Kafka topic to read from.
-# "startingOffsets" — "earliest" means read all messages from the
-#   beginning (useful for testing; in production you'd use "latest").
-
+# kafka:29092 is the internal Docker network address — unchanged from original
 kafka_df = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "kafka:29092") \
@@ -89,121 +103,290 @@ kafka_df = spark.readStream \
 print("[✓] Connected to Kafka topic 'stock-data'")
 
 # =================================================================
-# 4. PARSE JSON MESSAGES
+# 4. PARSE JSON AND APPLY EVENT-TIME WATERMARK
 # =================================================================
-# Kafka sends messages as raw bytes in a "value" column.
-# We cast bytes → string → parse JSON using our schema.
-
+# Cast timestamp string to TimestampType (event time = actual market time)
+# withWatermark: allow up to 5-minute late arrivals before closing windows
 parsed_df = kafka_df \
     .selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), stock_schema).alias("data")) \
     .select("data.*") \
-    .withColumn("timestamp", col("timestamp").cast(TimestampType()))
+    .withColumn("event_time", col("timestamp").cast(TimestampType())) \
+    .withWatermark("event_time", "5 minutes") \
+    .withColumn("date", to_date(col("event_time")))
 
-print("[✓] JSON schema applied to stream")
-
-# =================================================================
-# 5. COMPUTE ANALYTICS
-# =================================================================
-# These calculations run on EVERY micro-batch automatically.
-#
-# a) Price Change %  = ((close - open) / open) * 100
-# b) Volatility      = ((high - low) / open) * 100
-#
-# NOTE: Moving Average and Volume Trend (window functions)
-# are computed using stateful processing in the foreachBatch function
-# below, since window() over streaming DataFrames requires special
-# handling.
-
-analytics_df = parsed_df \
-    .withColumn(
-        "price_change_pct",
-        spark_round(((col("close") - col("open")) / col("open")) * 100, 2)
-    ) \
-    .withColumn(
-        "volatility",
-        spark_round(((col("high") - col("low")) / col("open")) * 100, 2)
-    ) \
-    .withColumn("processing_time", current_timestamp()) \
-    .withColumn("date", to_date(col("timestamp")))
-
-print("[✓] Analytics columns added (price_change_pct, volatility)")
+print("[✓] JSON schema applied | Event-time watermark set to 5 minutes")
 
 
 # =================================================================
-# 6. BATCH PROCESSING FUNCTION
+# 5. ANALYTICS HELPERS
 # =================================================================
-# foreachBatch lets us treat each micro-batch as a static DataFrame,
-# which allows us to use window functions (like moving average).
 
-def process_batch(batch_df, batch_id):
+def load_symbol_history(symbol: str) -> pd.DataFrame:
     """
-    Called once per micro-batch.
-    Adds moving average and volume trend, then:
-      - Prints to console
-      - Writes to Parquet
+    Load last HISTORY_LEN rows for a symbol from the state JSON file.
+    Returns empty DataFrame with correct columns if file not found.
     """
-    if batch_df.isEmpty():
+    path = os.path.join(STATE_DIR, f"{symbol}_history.json")
+    cols = ["symbol", "sector", "open", "high", "low", "close",
+            "volume", "event_time", "kafka_produce_time", "data_type", "date"]
+    if os.path.exists(path):
+        try:
+            df = pd.read_json(path, orient="records")
+            if not df.empty and "event_time" in df.columns:
+                df["event_time"] = pd.to_datetime(df["event_time"])
+                return df[cols] if all(c in df.columns for c in cols) else df
+        except Exception:
+            pass
+    return pd.DataFrame(columns=cols)
+
+
+def save_symbol_history(symbol: str, df: pd.DataFrame):
+    """
+    Persist the last HISTORY_LEN rows to the state JSON file.
+    Stores event_time as ISO string for JSON compatibility.
+    """
+    path = os.path.join(STATE_DIR, f"{symbol}_history.json")
+    try:
+        save_df = df.tail(HISTORY_LEN).copy()
+        save_df["event_time"] = save_df["event_time"].astype(str)
+        # date column: convert date to str if present
+        if "date" in save_df.columns:
+            save_df["date"] = save_df["date"].astype(str)
+        save_df.to_json(path, orient="records")
+    except Exception as e:
+        print(f"[!] Could not save history for {symbol}: {e}")
+
+
+def compute_rsi(close_series: pd.Series, periods: int = 14) -> pd.Series:
+    """
+    Compute Wilder's RSI for a close price series.
+    RSI = 100 - (100 / (1 + avg_gain / avg_loss))
+    Returns NaN for rows with insufficient history.
+    """
+    delta = close_series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Wilder's smoothed moving average
+    avg_gain = gain.ewm(com=periods - 1, min_periods=periods).mean()
+    avg_loss = loss.ewm(com=periods - 1, min_periods=periods).mean()
+
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.round(2)
+
+
+def enrich_symbol(symbol_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Given a DataFrame of rows for one symbol (may be just this batch),
+    load historical state, prepend it, compute rolling indicators on the
+    combined series, save updated state, then return ONLY the new rows
+    with all analytics columns filled in.
+
+    Args:
+        symbol_df: New rows from the current micro-batch for this symbol
+        symbol: The stock ticker string
+
+    Returns:
+        symbol_df rows enriched with all analytics columns
+    """
+    history = load_symbol_history(symbol)
+
+    # Tag new rows so we can filter them back out after computing on combined data
+    symbol_df = symbol_df.copy()
+    symbol_df["_is_new"] = True
+
+    # Combine history with new rows, sort by event time
+    if not history.empty:
+        history = history.copy()
+        history["_is_new"] = False
+        combined = pd.concat([history, symbol_df], ignore_index=True)
+    else:
+        combined = symbol_df.copy()
+
+    combined["event_time"] = pd.to_datetime(combined["event_time"])
+    combined = combined.sort_values("event_time").reset_index(drop=True)
+
+    # ---- Rolling indicators on the full combined series ----
+    close = combined["close"].astype(float)
+    volume = combined["volume"].astype(float)
+
+    combined["moving_avg_5"] = close.rolling(5, min_periods=1).mean().round(2)
+    combined["moving_avg_20"] = close.rolling(20, min_periods=1).mean().round(2)
+    combined["volatility"] = close.rolling(5, min_periods=2).std().round(4)
+    combined["rsi_14"] = compute_rsi(close, 14)
+
+    # VWAP: cumulative sum(price * volume) / cumulative sum(volume)
+    cum_pv = (close * volume).cumsum()
+    cum_v = volume.cumsum()
+    combined["vwap"] = (cum_pv / cum_v).round(2)
+
+    # Volume trend: current volume vs 5-period rolling average
+    vol_avg = volume.rolling(5, min_periods=1).mean()
+    combined["volume_trend"] = (volume / vol_avg.replace(0, float("nan"))).round(3)
+
+    # Price change % within each row (open→close)
+    combined["price_change_pct"] = (
+        (combined["close"] - combined["open"]) / combined["open"] * 100
+    ).round(2)
+
+    # Crash score: price dropped >2%, volume surge >2x avg, volatility > 1.5%
+    combined["crash_score"] = (
+        (combined["price_change_pct"] < -2.0) &
+        (combined["volume_trend"] > 2.0) &
+        (combined["volatility"].fillna(0) > 1.5)
+    )
+
+    # Latency: time from Kafka produce to Spark processing (ms)
+    spark_now_ms = int(time.time() * 1000)
+    combined["spark_process_time"] = spark_now_ms
+    combined["latency_ms"] = (
+        spark_now_ms - combined["kafka_produce_time"].fillna(spark_now_ms)
+    ).astype(int)
+
+    # Save full combined history for next batch
+    save_symbol_history(symbol, combined)
+
+    # Return ONLY the new rows (those from this batch)
+    new_rows = combined[combined["_is_new"] == True].copy()
+    new_rows = new_rows.drop(columns=["_is_new"])
+
+    return new_rows
+
+
+# =================================================================
+# 6. LOG BATCH METRICS
+# =================================================================
+
+def log_batch_metrics(batch_id: int, batch_df: pd.DataFrame, elapsed_ms: float):
+    """
+    Log per-batch processing stats to spark_metrics.jsonl.
+    Includes batch_id, row count per symbol, and processing duration.
+    """
+    per_symbol = batch_df.groupby("symbol").size().to_dict()
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "batch_id": batch_id,
+        "total_rows": len(batch_df),
+        "per_symbol": per_symbol,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+    try:
+        with open(SPARK_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+# =================================================================
+# 7. FOREACHBATCH PROCESSING
+# =================================================================
+
+def process_batch(batch_spark_df, batch_id: int):
+    """
+    Called once per micro-batch. Handles:
+      1. Write raw ticks to /data/raw_ticks/ (Volume V demonstration)
+      2. Enrich each symbol with rolling analytics using state store
+      3. Write enriched data to /data/processed/ (partitioned by symbol+date)
+      4. Log batch metrics to spark_metrics.jsonl
+
+    Uses event time from message, not processing time.
+    """
+    batch_start = time.time()
+
+    if batch_spark_df.isEmpty():
         print(f"[Batch {batch_id}] Empty — no new data")
         return
 
-    # Define a window: partition by stock symbol, ordered by timestamp
-    window_spec = Window.partitionBy("symbol").orderBy("timestamp")
+    # ---- Write raw ticks (unprocessed) for Volume V demonstration ----
+    # These are the unmodified records straight from Kafka
+    raw_df = batch_spark_df.select(
+        "symbol", "sector", "open", "high", "low", "close",
+        "volume", "event_time", "kafka_produce_time", "data_type", "date"
+    )
+    try:
+        raw_df.write \
+            .mode("append") \
+            .partitionBy("date") \
+            .parquet(RAW_TICKS_PATH)
+    except Exception as e:
+        print(f"[!] Raw tick write error (batch {batch_id}): {e}")
 
-    # 5-period Moving Average of close price
-    # Uses rows between -4 (4 rows before) and 0 (current row) = 5 rows total
-    window_avg = Window.partitionBy("symbol").orderBy("timestamp") \
-        .rowsBetween(-4, 0)
+    # ---- Convert to pandas for rich analytics ----
+    try:
+        pdf = batch_spark_df.toPandas()
+    except Exception as e:
+        print(f"[!] toPandas() failed (batch {batch_id}): {e}")
+        return
 
-    enriched_df = batch_df \
-        .withColumn(
-            "moving_avg_5",
-            spark_round(avg("close").over(window_avg), 2)
-        ) \
-        .withColumn(
-            "volume_cumulative",
-            spark_sum("volume").over(window_spec)
-        )
+    if pdf.empty:
+        return
 
-    # Count rows in this batch
-    count = enriched_df.count()
+    pdf["event_time"] = pd.to_datetime(pdf["event_time"])
+
+    # ---- Enrich each symbol using its state history ----
+    enriched_parts = []
+    for symbol, sym_df in pdf.groupby("symbol"):
+        try:
+            enriched = enrich_symbol(sym_df.copy(), str(symbol))
+            enriched_parts.append(enriched)
+        except Exception as e:
+            print(f"[!] Error enriching {symbol} (batch {batch_id}): {e}")
+
+    if not enriched_parts:
+        return
+
+    enriched_pdf = pd.concat(enriched_parts, ignore_index=True)
+
+    # Ensure date column is present and correct type for Parquet partitioning
+    if "date" not in enriched_pdf.columns or enriched_pdf["date"].isna().all():
+        enriched_pdf["date"] = enriched_pdf["event_time"].dt.date
+
+    # ---- Log per-symbol row counts (demonstrates partitioned processing) ----
+    elapsed_ms = (time.time() - batch_start) * 1000
+    log_batch_metrics(batch_id, enriched_pdf, elapsed_ms)
+
+    count = len(enriched_pdf)
     print(f"\n{'=' * 60}")
-    print(f" Batch {batch_id} — {count} records processed")
+    print(f" Batch {batch_id} — {count} records | {elapsed_ms:.0f}ms processing time")
     print(f"{'=' * 60}")
 
-    # Show a sample in the console
-    enriched_df.select(
+    # Quick sample to console
+    sample_cols = [
         "symbol", "close", "price_change_pct", "volatility",
-        "moving_avg_5", "volume_cumulative", "timestamp"
-    ).show(10, truncate=False)
+        "moving_avg_5", "rsi_14", "vwap", "crash_score", "data_type"
+    ]
+    available = [c for c in sample_cols if c in enriched_pdf.columns]
+    print(enriched_pdf[available].tail(10).to_string(index=False))
 
-    # Write to Parquet — partitioned by symbol AND date for efficient querying
-    enriched_df.write \
-        .mode("append") \
-        .partitionBy("symbol", "date") \
-        .parquet("/opt/spark/work/data/processed")
-
-    print(f"[✓] Batch {batch_id} written to data/processed/")
+    # ---- Write enriched analytics to Parquet ----
+    # Partitioned by symbol + date for efficient dashboard queries
+    try:
+        enriched_spark = spark.createDataFrame(enriched_pdf)
+        enriched_spark.write \
+            .mode("append") \
+            .partitionBy("symbol", "date") \
+            .parquet(PROCESSED_PATH)
+        print(f"[✓] Batch {batch_id} → data/processed/ ({count} rows)")
+    except Exception as e:
+        print(f"[!] Parquet write error (batch {batch_id}): {e}")
 
 
 # =================================================================
-# 7. START THE STREAMING QUERY
+# 8. START STREAMING QUERY
 # =================================================================
-# - foreachBatch: calls process_batch() on each micro-batch
-# - trigger(processingTime="10 seconds"): processes a batch every 10s
-# - checkpointLocation: stores progress so Spark can resume after crashes
-
 print("\n[▶] Starting streaming query...")
-print("[▶] Writing Parquet to: data/processed/")
-print("[▶] Checkpoint at: data/checkpoint/")
-print("[▶] Processing every 10 seconds")
-print("[▶] Press Ctrl+C to stop\n")
+print(f"[▶] Raw ticks  → {RAW_TICKS_PATH}")
+print(f"[▶] Processed  → {PROCESSED_PATH}")
+print(f"[▶] State      → {STATE_DIR}")
+print(f"[▶] Checkpoint → {CHECKPOINT_PATH}")
+print("[▶] Trigger: 10 seconds | Watermark: 5 minutes | Press Ctrl+C to stop\n")
 
-query = analytics_df.writeStream \
+query = parsed_df.writeStream \
     .foreachBatch(process_batch) \
-    .option("checkpointLocation", "/opt/spark/work/data/checkpoint") \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
     .trigger(processingTime="10 seconds") \
     .start()
 
-# Block until the query is stopped (Ctrl+C)
 query.awaitTermination()

@@ -20,14 +20,21 @@ services:
       - zookeeper
     ports:
       - "9092:9092"
-      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 2
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     networks:
       - stock-net
 
@@ -39,9 +46,17 @@ services:
     volumes:
       - ./:/opt/spark/work
     working_dir: /opt/spark/work
-    command: tail -f /dev/null
+    environment:
+      - HOME=/tmp
+      - SPARK_HOME=/opt/spark
+      - PATH=/opt/spark/bin:/opt/spark/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    command: >
+      bash -c "mkdir -p /tmp/.ivy2 /tmp/.cache /tmp/.m2 && tail -f /dev/null"
     ports:
       - "4040:4040"
+    # ADDITIVE: service-level resource limits (works with standard docker-compose, no Swarm needed)
+    mem_limit: 4g
+    cpus: 2
     networks:
       - stock-net
 
